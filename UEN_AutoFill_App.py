@@ -320,14 +320,72 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-DB_PATH = "./UEN_AutoFill/database.db"
-if not os.path.exists(DB_PATH):
-    st.markdown('<div class="warn-box">⚠️ <strong>database.db not found.</strong> Place it in the same folder as this script.</div>', unsafe_allow_html=True)
+# ─── CONSTANTS ────────────────────────────────────────────────────────────────
+DB_PATHS = [
+    "./database_1.db",
+    "./database_2.db",
+    "./database_3.db",
+    "./database_4.db",
+]
+
+# ─── DB LOADER ────────────────────────────────────────────────────────────────
+@st.cache_resource(show_spinner="Loading reference database…")
+def load_uen_entries(db_paths):
+    exact_index = {}
+    substr_list = []
+    alias_list  = []
+
+    for db_path in db_paths:
+        if not os.path.exists(db_path):
+            st.warning(f"⚠️ Database not found: {db_path} — skipping.")
+            continue
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute("SELECT company_name, uen, aliases FROM companies").fetchall()
+        conn.close()
+
+        for raw_name, uen, alias_raw in rows:
+            raw_name  = (raw_name  or "").strip()
+            uen       = (uen       or "").strip()
+            alias_raw = (alias_raw or "").strip()
+            if not raw_name and not uen:
+                continue
+            norm_name = normalise(raw_name)
+            if not norm_name:
+                continue
+            # Skip duplicates already loaded from a previous shard
+            if norm_name in exact_index:
+                continue
+            mtoks   = meaningful_tokens(norm_name)
+            aliases = [normalise(a.strip()) for a in alias_raw.split(",") if a.strip()] if alias_raw else []
+
+            exact_index[norm_name] = uen
+
+            entry = {
+                "n":  norm_name,
+                "nl": len(norm_name),
+                "u":  uen,
+                "ts": frozenset(mtoks),
+                "tl": len(mtoks),
+                "al": aliases,
+            }
+            substr_list.append(entry)
+            if aliases:
+                alias_list.append(entry)
+
+    return exact_index, substr_list, alias_list
+
+# ─── UI — replace the old DB_PATH block with this ─────────────────────────────
+missing = [p for p in DB_PATHS if not os.path.exists(p)]
+if len(missing) == len(DB_PATHS):
+    st.markdown('<div class="warn-box">⚠️ <strong>No database shards found.</strong> '
+                'Place database_1.db … database_4.db in ./UEN_AutoFill/</div>',
+                unsafe_allow_html=True)
     st.stop()
 
-exact_index, substr_list, alias_list = load_uen_entries(DB_PATH)
-st.markdown(f'<div class="info-box">✅ Reference database loaded — <strong>{len(exact_index):,}</strong> company records</div>', unsafe_allow_html=True)
-st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
+exact_index, substr_list, alias_list = load_uen_entries(tuple(DB_PATHS))
+st.markdown(f'<div class="info-box">✅ Reference database loaded — '
+            f'<strong>{len(exact_index):,}</strong> company records</div>',
+            unsafe_allow_html=True)
 
 # ── STEP 1 ────────────────────────────────────────────────────────────────────
 st.markdown('<div class="card-top"><div class="step-label">Step 1</div><div class="step-title">Upload your file</div></div>', unsafe_allow_html=True)
