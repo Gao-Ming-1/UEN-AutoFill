@@ -4,7 +4,16 @@ import sqlite3
 import re
 import io
 import os
+import subprocess
+import sys
 from pathlib import Path
+
+# ─── ENSURE openpyxl IS AVAILABLE ─────────────────────────────────────────────
+try:
+    import openpyxl
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "openpyxl", "--quiet"])
+    import openpyxl
 
 st.set_page_config(page_title="UEN Autofill", page_icon="🔍", layout="wide", initial_sidebar_state="collapsed")
 
@@ -20,7 +29,7 @@ html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
 
 .top-banner {
     background: #1A1A1A; color: #F7F6F2;
-    padding: 1.5rem 2rem; border-radius: 12px; margin-bottom: 1.5rem;
+    padding: 1.5rem 2rem; border-radius: 12px; margin-bottom: 1rem;
 }
 .top-banner h1 { font-size: 1.6rem; font-weight: 600; margin: 0; letter-spacing: -0.5px; }
 .top-banner p  { font-size: 0.85rem; color: #9A9A9A; margin: 0.2rem 0 0 0; }
@@ -28,6 +37,12 @@ html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
     background: #3DBA6F; color: white; font-size: 0.7rem; font-weight: 600;
     padding: 0.2rem 0.6rem; border-radius: 20px; letter-spacing: 0.5px; text-transform: uppercase;
 }
+.pdpa-box {
+    background: #F5F0FF; border-left: 3px solid #7B5EA7; border-radius: 0 8px 8px 0;
+    padding: 0.75rem 1rem; font-size: 0.82rem; color: #3D2A6B; margin-bottom: 1rem;
+    line-height: 1.6;
+}
+.pdpa-box strong { color: #5A3D9A; }
 .card-top { background:white; border:1px solid #E8E6DF; border-radius:12px 12px 0 0; border-bottom:none; padding:1.4rem 1.5rem 0.8rem 1.5rem; }
 .card-mid { background:white; border-left:1px solid #E8E6DF; border-right:1px solid #E8E6DF; padding:0 1.5rem 1.4rem 1.5rem; }
 .card-sep { background:white; border:1px solid #E8E6DF; border-bottom:none; padding:1.4rem 1.5rem 0.8rem 1.5rem; }
@@ -50,6 +65,7 @@ html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
     background:#1A1A1A !important; color:white !important; border:none !important;
     border-radius:8px !important; font-family:'DM Sans',sans-serif !important;
     font-weight:500 !important; padding:0.6rem 1.4rem !important; font-size:0.9rem !important;
+    width:100% !important;
 }
 .stDownloadButton button:hover { background:#333 !important; }
 .stButton button {
@@ -69,7 +85,8 @@ html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
     background:#FFF8EC; border-left:3px solid #F5A623; border-radius:0 8px 8px 0;
     padding:0.75rem 1rem; font-size:0.85rem; color:#7A5500; margin-bottom:0;
 }
-/* Toggle switch styling */
+.dl-section { background:#F7F6F2; border:1px solid #E8E6DF; border-radius:10px; padding:1.2rem 1.4rem; margin-top:1rem; }
+.dl-section-title { font-size:0.78rem; font-weight:600; letter-spacing:0.8px; text-transform:uppercase; color:#9A9A9A; margin-bottom:0.8rem; }
 .stToggle { margin-top: 0.3rem; }
 </style>
 """, unsafe_allow_html=True)
@@ -83,6 +100,13 @@ NA_PATTERNS = [
     re.compile(r"^'[-@\s]*$"),       re.compile(r'^[^a-zA-Z0-9]+$'),
 ]
 GENERIC_NON_COMPANIES = {"freelance","freelancer","self-employed","unemployed"}
+
+DB_PATHS = [
+    "./database_1.db",
+    "./database_2.db",
+    "./database_3.db",
+    "./database_4.db",
+]
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 def is_na(value):
@@ -122,48 +146,53 @@ def clean_val(v):
     s = str(v).strip()
     return "" if s in ("nan","None","<NA>","NaN") else s
 
+def clear_session_data():
+    """Wipe all processed/uploaded data from session state."""
+    for key in ["processed_df", "stats", "preview_two_col", "uen_only_df"]:
+        if key in st.session_state:
+            del st.session_state[key]
+
 # ─── DB LOADER ────────────────────────────────────────────────────────────────
-# Strategy for speed:
-#   - exact_index: dict for O(1) tier-1 hit (covers ~80%+ of real data)
-#   - substr_list: only entries whose normName length is reasonable  
-#     (skipping very short names that cause false positives anyway)
-#   - alias_list: separate list so we only loop alias entries in tier-3
-#   - token_list: for tier-4, pre-build frozenset of tokens per entry
 @st.cache_resource(show_spinner="Loading reference database…")
-def load_uen_entries(db_path):
-    conn = sqlite3.connect(db_path)
-    rows = conn.execute("SELECT company_name, uen, aliases FROM companies").fetchall()
-    conn.close()
+def load_uen_entries(db_paths):
+    exact_index = {}
+    substr_list = []
+    alias_list  = []
 
-    exact_index  = {}   # normName -> uen
-    substr_list  = []   # [{normName, normLen, uen, tok_set, aliases}]  for tiers 2-4
-    alias_list   = []   # subset of substr_list that has aliases
-
-    for raw_name, uen, alias_raw in rows:
-        raw_name  = (raw_name  or "").strip()
-        uen       = (uen       or "").strip()
-        alias_raw = (alias_raw or "").strip()
-        if not raw_name and not uen:
+    for db_path in db_paths:
+        if not os.path.exists(db_path):
             continue
-        norm_name = normalise(raw_name)
-        if not norm_name:
-            continue
-        mtoks   = meaningful_tokens(norm_name)
-        aliases = [normalise(a.strip()) for a in alias_raw.split(",") if a.strip()] if alias_raw else []
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute("SELECT company_name, uen, aliases FROM companies").fetchall()
+        conn.close()
 
-        exact_index[norm_name] = uen
+        for raw_name, uen, alias_raw in rows:
+            raw_name  = (raw_name  or "").strip()
+            uen       = (uen       or "").strip()
+            alias_raw = (alias_raw or "").strip()
+            if not raw_name and not uen:
+                continue
+            norm_name = normalise(raw_name)
+            if not norm_name:
+                continue
+            if norm_name in exact_index:
+                continue
+            mtoks   = meaningful_tokens(norm_name)
+            aliases = [normalise(a.strip()) for a in alias_raw.split(",") if a.strip()] if alias_raw else []
 
-        entry = {
-            "n":  norm_name,
-            "nl": len(norm_name),
-            "u":  uen,
-            "ts": frozenset(mtoks),   # frozenset for fast superset check in tier-4
-            "tl": len(mtoks),
-            "al": aliases,
-        }
-        substr_list.append(entry)
-        if aliases:
-            alias_list.append(entry)
+            exact_index[norm_name] = uen
+
+            entry = {
+                "n":  norm_name,
+                "nl": len(norm_name),
+                "u":  uen,
+                "ts": frozenset(mtoks),
+                "tl": len(mtoks),
+                "al": aliases,
+            }
+            substr_list.append(entry)
+            if aliases:
+                alias_list.append(entry)
 
     return exact_index, substr_list, alias_list
 
@@ -172,23 +201,18 @@ def find_uen(typed_name, exact_index, substr_list, alias_list):
     norm_query = normalise(typed_name)
     if not norm_query:
         return ""
-
-    # Tier 1: O(1) exact match
     if norm_query in exact_index:
         return exact_index[norm_query]
 
-    query_toks = meaningful_tokens(norm_query)
-    nq_len     = len(norm_query)
+    query_toks    = meaningful_tokens(norm_query)
+    nq_len        = len(norm_query)
     best_uen, best_score = "", -1
-
-    # Pre-compute query token set for tier-4
     query_tok_set = frozenset(query_toks)
 
     for entry in substr_list:
         en     = entry["n"]
         en_len = entry["nl"]
 
-        # ── Tier 2: substring with ratio guard ──────────────────────────────
         if nq_len <= en_len:
             sl, ratio, hit = nq_len, nq_len / en_len, norm_query in en
         else:
@@ -198,10 +222,8 @@ def find_uen(typed_name, exact_index, substr_list, alias_list):
             score = 5000 + sl
             if score > best_score:
                 best_score, best_uen = score, entry["u"]
-            continue  # already better than tiers 3/4, move on
+            continue
 
-        # ── Tier 3: alias substring match ───────────────────────────────────
-        # Only executed for entries that actually have aliases
         if entry["al"]:
             alias_hit = False
             for alias in entry["al"]:
@@ -219,28 +241,20 @@ def find_uen(typed_name, exact_index, substr_list, alias_list):
             if alias_hit:
                 continue
 
-        # ── Tier 4: token overlap ────────────────────────────────────────────
-        # Fast path: use frozenset superset check first.
-        # If the entry's token set doesn't contain ALL query tokens as exact
-        # matches, fall back to the substring-aware loop only when needed.
         if query_toks and entry["ts"]:
-            et_set = entry["ts"]
-            et_list = list(et_set)  # only used if frozenset check fails
+            et_set  = entry["ts"]
+            et_list = list(et_set)
 
-            # Fast check: all query tokens are exact members of entry token set
             if query_tok_set <= et_set:
                 score = 2000 - abs(entry["tl"] - len(query_toks)) * 10
                 if score > best_score:
                     best_score, best_uen = score, entry["u"]
             else:
-                # Slower substring check — only if the sets have some overlap
-                if not query_tok_set.isdisjoint(et_set) or any(
-                    len(qt) >= 4 for qt in query_toks
-                ):
+                if not query_tok_set.isdisjoint(et_set) or any(len(qt) >= 4 for qt in query_toks):
                     matched = 0
                     for qt in query_toks:
                         qt_len = len(qt)
-                        found = False
+                        found  = False
                         for et in et_list:
                             if et == qt or (qt_len >= 4 and qt in et) or (len(et) >= 4 and et in qt):
                                 found = True
@@ -248,7 +262,7 @@ def find_uen(typed_name, exact_index, substr_list, alias_list):
                         if found:
                             matched += 1
                         else:
-                            break   # short-circuit: can't match all tokens
+                            break
                     if matched == len(query_toks):
                         score = 2000 - abs(entry["tl"] - len(query_toks)) * 10
                         if score > best_score:
@@ -262,10 +276,8 @@ def process_df(df, name_col_idx, uen_col_idx, header_row_idx, end_row_1based,
     result_df = df.copy()
     filled = replaced = already = na_count = no_match = 0
 
-    # header_row_idx is 0-based.  Data starts on the row AFTER the header.
     data_start = header_row_idx + 1
-    # end_row_1based=0 means auto (last row). Otherwise it's the user's 1-based row number.
-    data_end = (end_row_1based - 1) if end_row_1based > 0 else (len(df) - 1)
+    data_end   = (end_row_1based - 1) if end_row_1based > 0 else (len(df) - 1)
 
     nc = df.columns[name_col_idx]
     uc = df.columns[uen_col_idx]
@@ -306,6 +318,95 @@ def process_df(df, name_col_idx, uen_col_idx, header_row_idx, end_row_1based,
 
     return result_df, {"filled":filled,"replaced":replaced,"already":already,"na":na_count,"no_match":no_match}
 
+# ─── EXCEL BUILDERS ───────────────────────────────────────────────────────────
+def build_full_excel(df):
+    """Return bytes of the full processed sheet as xlsx."""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        df.to_excel(w, index=False, header=False)
+    return buf.getvalue()
+
+def build_uen_only_excel(df, name_col_idx, uen_col_idx, header_row_idx):
+    """
+    Return bytes of a clean 2-column xlsx:
+      Column A = Company Name   Column B = UEN
+    Header comes from the user's chosen header row.
+    Rows with NA in both columns are excluded.
+    Styled with openpyxl: header bold+fill, auto column widths.
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    out_df = df.copy().fillna("").replace({"nan":"","None":"","<NA>":""})
+
+    # Pull header labels from the header row
+    hdr_name = clean_val(out_df.iloc[header_row_idx, name_col_idx]) or "Company Name"
+    hdr_uen  = clean_val(out_df.iloc[header_row_idx, uen_col_idx])  or "UEN"
+
+    # Data rows only (skip header row itself)
+    data_rows = []
+    for i in range(header_row_idx + 1, len(out_df)):
+        name_val = clean_val(out_df.iloc[i, name_col_idx])
+        uen_val  = clean_val(out_df.iloc[i, uen_col_idx])
+        if name_val == "NA" and uen_val == "NA":
+            continue  # skip blank/NA rows
+        data_rows.append((name_val, uen_val))
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "UEN Results"
+
+    # ── Header styling ──────────────────────────────────────────────────────
+    header_fill = PatternFill("solid", fgColor="1A1A1A")
+    header_font = Font(bold=True, color="F7F6F2", name="Arial", size=10)
+    thin_side   = Side(style="thin", color="E8E6DF")
+    thin_border = Border(bottom=Side(style="thin", color="CCCCCC"))
+
+    ws.append([hdr_name, hdr_uen])
+    for col_idx in range(1, 3):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.font      = header_font
+        cell.fill      = header_fill
+        cell.alignment = Alignment(horizontal="left", vertical="center")
+    ws.row_dimensions[1].height = 22
+
+    # ── Data rows ────────────────────────────────────────────────────────────
+    alt_fill  = PatternFill("solid", fgColor="F7F6F2")
+    data_font = Font(name="Arial", size=10)
+    uen_font  = Font(name="DM Mono", size=10, color="1A6E3F")
+
+    for row_num, (name_val, uen_val) in enumerate(data_rows, start=2):
+        ws.append([name_val, uen_val])
+        fill = alt_fill if row_num % 2 == 0 else PatternFill("solid", fgColor="FFFFFF")
+        name_cell     = ws.cell(row=row_num, column=1)
+        uen_cell      = ws.cell(row=row_num, column=2)
+        name_cell.font = data_font
+        name_cell.fill = fill
+        name_cell.alignment = Alignment(vertical="center")
+        uen_cell.font  = uen_font
+        uen_cell.fill  = fill
+        uen_cell.alignment = Alignment(horizontal="left", vertical="center")
+        ws.row_dimensions[row_num].height = 18
+
+    # ── Auto column widths ───────────────────────────────────────────────────
+    for col_cells in ws.columns:
+        max_len = 0
+        col_letter = get_column_letter(col_cells[0].column)
+        for cell in col_cells:
+            try:
+                max_len = max(max_len, len(str(cell.value or "")))
+            except Exception:
+                pass
+        ws.column_dimensions[col_letter].width = min(max_len + 4, 60)
+
+    # Freeze header row
+    ws.freeze_panes = "A2"
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  UI
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -320,65 +421,21 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# ─── CONSTANTS ────────────────────────────────────────────────────────────────
-DB_PATHS = [
-    "./database_1.db",
-    "./database_2.db",
-    "./database_3.db",
-    "./database_4.db",
-]
+# ── PDPA DISCLAIMER ───────────────────────────────────────────────────────────
+st.markdown("""
+<div class="pdpa-box">
+  🔒 <strong>Privacy Notice (PDPA)</strong> &nbsp;·&nbsp;
+  This tool processes your uploaded file solely for UEN matching.
+  Uploaded data is <strong>not stored, logged, or shared</strong> — it exists only in temporary memory during your session and is discarded immediately after processing.
+  Do not upload files containing sensitive personal data beyond what is necessary for UEN lookup.
+</div>
+""", unsafe_allow_html=True)
 
-# ─── DB LOADER ────────────────────────────────────────────────────────────────
-@st.cache_resource(show_spinner="Loading reference database…")
-def load_uen_entries(db_paths):
-    exact_index = {}
-    substr_list = []
-    alias_list  = []
-
-    for db_path in db_paths:
-        if not os.path.exists(db_path):
-            st.warning(f"⚠️ Database not found: {db_path} — skipping.")
-            continue
-        conn = sqlite3.connect(db_path)
-        rows = conn.execute("SELECT company_name, uen, aliases FROM companies").fetchall()
-        conn.close()
-
-        for raw_name, uen, alias_raw in rows:
-            raw_name  = (raw_name  or "").strip()
-            uen       = (uen       or "").strip()
-            alias_raw = (alias_raw or "").strip()
-            if not raw_name and not uen:
-                continue
-            norm_name = normalise(raw_name)
-            if not norm_name:
-                continue
-            # Skip duplicates already loaded from a previous shard
-            if norm_name in exact_index:
-                continue
-            mtoks   = meaningful_tokens(norm_name)
-            aliases = [normalise(a.strip()) for a in alias_raw.split(",") if a.strip()] if alias_raw else []
-
-            exact_index[norm_name] = uen
-
-            entry = {
-                "n":  norm_name,
-                "nl": len(norm_name),
-                "u":  uen,
-                "ts": frozenset(mtoks),
-                "tl": len(mtoks),
-                "al": aliases,
-            }
-            substr_list.append(entry)
-            if aliases:
-                alias_list.append(entry)
-
-    return exact_index, substr_list, alias_list
-
-# ─── UI — replace the old DB_PATH block with this ─────────────────────────────
-missing = [p for p in DB_PATHS if not os.path.exists(p)]
-if len(missing) == len(DB_PATHS):
+# ── DATABASE ──────────────────────────────────────────────────────────────────
+missing_dbs = [p for p in DB_PATHS if not os.path.exists(p)]
+if len(missing_dbs) == len(DB_PATHS):
     st.markdown('<div class="warn-box">⚠️ <strong>No database shards found.</strong> '
-                'Place database_1.db … database_4.db in ./UEN_AutoFill/</div>',
+                'Place database_1.db … database_4.db in the app root directory.</div>',
                 unsafe_allow_html=True)
     st.stop()
 
@@ -386,11 +443,13 @@ exact_index, substr_list, alias_list = load_uen_entries(tuple(DB_PATHS))
 st.markdown(f'<div class="info-box">✅ Reference database loaded — '
             f'<strong>{len(exact_index):,}</strong> company records</div>',
             unsafe_allow_html=True)
+st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
 
 # ── STEP 1 ────────────────────────────────────────────────────────────────────
 st.markdown('<div class="card-top"><div class="step-label">Step 1</div><div class="step-title">Upload your file</div></div>', unsafe_allow_html=True)
 st.markdown('<div class="card-mid">', unsafe_allow_html=True)
-uploaded_file = st.file_uploader("file", type=["xlsx","xls","csv"], label_visibility="collapsed")
+uploaded_file = st.file_uploader("file", type=["xlsx","xls","csv"], label_visibility="collapsed",
+                                  on_change=clear_session_data)
 st.markdown('</div>', unsafe_allow_html=True)
 
 if uploaded_file is None:
@@ -399,23 +458,22 @@ if uploaded_file is None:
 
 @st.cache_data(show_spinner="Reading file…")
 def load_file(file_bytes, file_name):
-    if file_name.endswith(".csv"):
-        return pd.read_csv(io.BytesIO(file_bytes), header=None, dtype=str)
-    return pd.read_excel(io.BytesIO(file_bytes), header=None, dtype=str)
+    try:
+        if file_name.endswith(".csv"):
+            return pd.read_csv(io.BytesIO(file_bytes), header=None, dtype=str)
+        return pd.read_excel(io.BytesIO(file_bytes), header=None, dtype=str, engine="openpyxl")
+    except Exception as e:
+        raise RuntimeError(f"Could not read file: {e}")
 
 file_bytes = uploaded_file.read()
 try:
     raw_df = load_file(file_bytes, uploaded_file.name)
 except Exception as e:
-    st.error(f"Could not read file: {e}"); st.stop()
+    st.error(str(e)); st.stop()
 
 num_rows, num_cols = raw_df.shape
 col_letters = [col_index_to_letter(i) for i in range(num_cols)]
-
-# Header row selector: 0-based labels ("Row 0", "Row 1", …) shown to user,
-# stored as integers so there's no +1/-1 confusion anywhere.
-# "Row 0" = the very first row of the file (pandas index 0).
-row_options = [f"Row {i}" for i in range(min(num_rows, 500))]
+row_options  = [f"Row {i}" for i in range(min(num_rows, 500))]
 
 # ── STEP 2 ────────────────────────────────────────────────────────────────────
 st.markdown('<div class="card-sep"><div class="step-label">Step 2</div><div class="step-title">Map your columns</div></div>', unsafe_allow_html=True)
@@ -432,7 +490,6 @@ st.markdown('</div>', unsafe_allow_html=True)
 
 name_col_idx   = col_letter_to_index(name_col_letter)
 uen_col_idx    = col_letter_to_index(uen_col_letter)
-# header_row_idx is 0-based — directly extracted from "Row N" label
 header_row_idx = int(header_row_sel.split()[1])
 
 # ── STEP 3: PREVIEW ───────────────────────────────────────────────────────────
@@ -447,8 +504,6 @@ uen_col_label  = f"{uen_col_letter}  (col {uen_col_idx+1})"
 
 def highlight_cols(df):
     s = pd.DataFrame("", index=df.index, columns=df.columns)
-    # df.index here is the original pandas RangeIndex (0, 1, 2, …)
-    # header_row_idx is also 0-based, so this is a direct comparison
     mask = df.index >= header_row_idx
     if name_col_label in df.columns:
         s.loc[mask, name_col_label] = "background-color:#EBF5FF;color:#2C5F8A;font-weight:500;"
@@ -467,9 +522,9 @@ with pi1:
         unsafe_allow_html=True)
 with pi2:
     data_end_row = (end_row_input - 1) if end_row_input > 0 else (num_rows - 1)
-    data_rows    = max(0, data_end_row - header_row_idx)
+    data_rows_n  = max(0, data_end_row - header_row_idx)
     st.markdown(
-        f'Rows to process: <span class="cell-ref">{data_rows}</span>'
+        f'Rows to process: <span class="cell-ref">{data_rows_n}</span>'
         f' &nbsp;(header = <span class="cell-ref">{header_row_sel}</span>)',
         unsafe_allow_html=True)
 st.markdown('</div>', unsafe_allow_html=True)
@@ -486,7 +541,7 @@ if st.button("▶  Run UEN Autofill", use_container_width=True):
             exact_index, substr_list, alias_list)
     st.session_state["processed_df"]    = processed_df
     st.session_state["stats"]           = stats
-    st.session_state["preview_two_col"] = True   # default: show two-col view
+    st.session_state["preview_two_col"] = True
     st.success("Done!")
 
 if "processed_df" in st.session_state:
@@ -501,25 +556,50 @@ if "processed_df" in st.session_state:
     </div>
     """, unsafe_allow_html=True)
 
-    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
     out_name = Path(uploaded_file.name).stem + "_processed"
-    dl1, dl2 = st.columns(2)
+
+    # ── Download section ────────────────────────────────────────────────────
+    st.markdown('<div class="dl-section">', unsafe_allow_html=True)
+    st.markdown('<div class="dl-section-title">📥 Download results</div>', unsafe_allow_html=True)
+
+    dl1, dl2, dl3 = st.columns(3)
+
     with dl1:
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as w:
-            st.session_state["processed_df"].to_excel(w, index=False, header=False)
-        st.download_button("⬇  Download as Excel (.xlsx)", buf.getvalue(),
-            file_name=out_name+".xlsx",
+        st.markdown("**Full sheet** *(original columns + UEN filled)*")
+        st.download_button(
+            "⬇  Excel (.xlsx)",
+            build_full_excel(st.session_state["processed_df"]),
+            file_name=out_name + ".xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True)
+
     with dl2:
-        st.download_button("⬇  Download as CSV",
+        st.markdown("**Full sheet** *(CSV)*")
+        st.download_button(
+            "⬇  CSV",
             st.session_state["processed_df"].to_csv(index=False, header=False),
-            file_name=out_name+".csv", mime="text/csv", use_container_width=True)
+            file_name=out_name + ".csv",
+            mime="text/csv",
+            use_container_width=True)
 
-    st.markdown("<br>", unsafe_allow_html=True)
+    with dl3:
+        st.markdown("**Company Name + UEN only** *(clean 2-column Excel)*")
+        uen_only_bytes = build_uen_only_excel(
+            st.session_state["processed_df"],
+            name_col_idx, uen_col_idx, header_row_idx)
+        st.download_button(
+            "⬇  UEN Results (.xlsx)",
+            uen_only_bytes,
+            file_name=out_name + "_uen_only.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True)
 
-    # ── Processed preview with toggle ─────────────────────────────────────
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
+
+    # ── Processed preview with toggle ──────────────────────────────────────
     with st.expander("Preview processed output", expanded=True):
         two_col_view = st.toggle(
             "Show Company Name & UEN columns only",
@@ -532,20 +612,16 @@ if "processed_df" in st.session_state:
         out_df = out_df.fillna("").replace({"nan":"","None":"","<NA>":""})
 
         if two_col_view:
-            # Slice from header row, only the two relevant columns.
-            # Use .iloc so we get the header row as row-0 of the displayed table.
             sliced = out_df.iloc[header_row_idx:, [name_col_idx, uen_col_idx]].copy()
-            # The header row's cells become the column names
             new_cols = [
                 str(sliced.iloc[0, 0]) or f"{name_col_letter} — Company Name",
                 str(sliced.iloc[0, 1]) or f"{uen_col_letter} — UEN",
             ]
-            sliced = sliced.iloc[1:].copy()   # drop the header row from data
+            sliced = sliced.iloc[1:].copy()
             sliced.columns = new_cols
             sliced.index = range(len(sliced))
             st.dataframe(sliced, width='stretch', height=400)
         else:
-            # Show full sheet from header row, using header row cells as column names
             full = out_df.iloc[header_row_idx:].copy()
             header_vals = [str(v) if str(v) not in ("","nan","None") else f"Col {col_index_to_letter(i)}"
                            for i, v in enumerate(full.iloc[0])]
@@ -553,5 +629,13 @@ if "processed_df" in st.session_state:
             full.columns = header_vals
             full.index = range(len(full))
             st.dataframe(full, width='stretch', height=400)
+
+    # ── Auto-clear notice ───────────────────────────────────────────────────
+    st.markdown("""
+    <div style="margin-top:1rem; font-size:0.78rem; color:#9A9A9A; text-align:center;">
+    🔒 Session data is held in memory only and is automatically discarded when you close or refresh this page.
+    No data is written to disk or transmitted externally.
+    </div>
+    """, unsafe_allow_html=True)
 
 st.markdown('</div>', unsafe_allow_html=True)
