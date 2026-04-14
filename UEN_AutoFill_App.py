@@ -578,7 +578,7 @@ if "processed_df" in st.session_state:
             use_container_width=True)
 
     with dl3:
-        st.markdown("**Company Name + UEN only** *(clean 2-column Excel)*")
+        st.markdown("**Company Name + UEN only**")
         uen_only_bytes = build_uen_only_excel(
             st.session_state["processed_df"],
             name_col_idx, uen_col_idx, header_row_idx)
