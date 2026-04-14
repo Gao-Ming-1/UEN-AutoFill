@@ -7,13 +7,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-
-# ─── ENSURE openpyxl IS AVAILABLE ─────────────────────────────────────────────
-try:
-    import openpyxl
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "openpyxl", "--quiet"])
-    import openpyxl
+import openpyxl
 
 st.set_page_config(page_title="UEN Autofill", page_icon="🔍", layout="wide", initial_sidebar_state="collapsed")
 
