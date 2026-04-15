@@ -117,18 +117,47 @@ def clear_session_data():
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  FTS5 SETUP
+#
+#  The FTS5 table indexes both company_name AND aliases so that tier-5 FTS5
+#  queries can match on alias text too (e.g. a query of "IHRP" will match
+#  the aliases column even when no company_name contains "IHRP").
+#
+#  uen is stored UNINDEXED — we only need it for retrieval, not searching.
+#
+#  If a previous version of the table was built without the aliases column,
+#  ensure_fts5 drops and rebuilds it automatically on first startup.
 # ═══════════════════════════════════════════════════════════════════════════════
 def ensure_fts5(db_path: str) -> None:
     conn = sqlite3.connect(db_path)
-    exists = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='companies_fts'"
+
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='companies_fts'"
     ).fetchone()
-    if not exists:
+
+    needs_build = False
+    if row is None:
+        needs_build = True
+    elif row[0] and "aliases" not in row[0]:
+        # Old table missing aliases column — drop and rebuild
+        conn.execute("DROP TABLE IF EXISTS companies_fts")
+        conn.commit()
+        needs_build = True
+
+    if needs_build:
         conn.execute("""
             CREATE VIRTUAL TABLE companies_fts
-            USING fts5(company_name, uen, tokenize='unicode61 remove_diacritics 1')
+            USING fts5(
+                company_name,
+                aliases,
+                uen UNINDEXED,
+                tokenize='unicode61 remove_diacritics 1'
+            )
         """)
-        conn.execute("INSERT INTO companies_fts(company_name, uen) SELECT company_name, uen FROM companies")
+        conn.execute("""
+            INSERT INTO companies_fts(company_name, aliases, uen)
+            SELECT company_name, COALESCE(aliases, ''), uen
+            FROM companies
+        """)
         conn.commit()
     conn.close()
 
@@ -136,29 +165,20 @@ def ensure_fts5(db_path: str) -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 #  INDEX BUILD
 #
-#  Memory layout (per cached resource):
-#
-#  exact        dict  norm_name  -> uen               O(1) tier-1
-#  alias_exact  dict  norm_alias -> uen               O(1) tier-3 exact alias
-#
-#  fw_index     dict  first_word -> list of tuples    O(1) bucket + tiny scan
-#               Each tuple: (norm_name, uen, alias_norms_tuple)
-#               alias_norms_tuple is a plain tuple of normalised alias strings.
-#               Keeping aliases here (not a separate scan list) means:
-#                 • Tier-2 and tier-3 substring checks share ONE loop — no
-#                   extra pass over data.
-#                 • Memory: alias strings are sys.intern'd so repeated strings
-#                   share a single object; the tuple has no per-entry overhead
-#                   beyond a pointer.
-#
-#  fts_conns    list  of open read-only sqlite3.Connection  (tier-4)
+#  Memory structures:
+#    exact        dict  norm_name  -> uen    tier-1  O(1) exact name
+#    alias_exact  dict  norm_alias -> uen    tier-2  O(1) exact alias  ← checked
+#                                            immediately after tier-1 so short
+#                                            alias-only names are never missed
+#    fw_index     dict  first_word -> [(norm_name, uen, alias_norms_tuple)]
+#                                            tier-3/4 substring scan
+#    fts_conns    list  open read-only connections  tier-5 FTS5 fallback
 # ═══════════════════════════════════════════════════════════════════════════════
-
 @st.cache_resource(show_spinner="Loading reference database…")
 def build_indexes(db_paths: tuple):
-    exact       = {}               # norm_name  -> uen
-    alias_exact = {}               # norm_alias -> uen  (exact alias hit, O(1))
-    fw_index    = defaultdict(list)# first_word -> [(norm_name, uen, (alias, ...))]
+    exact       = {}
+    alias_exact = {}
+    fw_index    = defaultdict(list)
     fts_conns   = []
     seen        = set()
 
@@ -186,7 +206,7 @@ def build_indexes(db_paths: tuple):
                 continue
 
             norm_name = sys.intern(normalise(raw_name))
-            uen       = sys.intern(uen.upper())   # ← store UENs upper-cased at build time
+            uen       = sys.intern(uen.upper())
             if not norm_name or norm_name in seen:
                 continue
             seen.add(norm_name)
@@ -194,35 +214,27 @@ def build_indexes(db_paths: tuple):
             # tier-1
             exact[norm_name] = uen
 
-            # build alias tuple (interned strings, zero duplication)
+            # alias structures
             alias_norms = ()
             if alias_raw:
                 parts = []
                 for a in alias_raw.split(","):
                     a = a.strip()
-                    if not a: continue
+                    if not a:
+                        continue
                     na = sys.intern(normalise(a))
                     if na:
                         parts.append(na)
-                        # also populate alias_exact for O(1) exact alias hit
                         if na not in alias_exact:
                             alias_exact[na] = uen
                 alias_norms = tuple(parts)
 
-            # fw_index: bucket by every meaningful word in the name so
-            # abbreviated queries still find the right bucket.
-            # e.g. "st andrew's cathedral" is indexed under "st", "andrew",
-            # "cathedral" — so query "st andrew" hits the "st" bucket.
+            # fw_index: bucket by first word + additional meaningful words
             words = norm_name.split()
             if not words:
                 continue
-
             entry = (norm_name, uen, alias_norms)
-            # Index under first word (most selective, free with the split)
             fw_index[words[0]].append(entry)
-            # Also index under any other meaningful word that is NOT in the
-            # first-word bucket already — this covers queries that omit the
-            # first word of the official name.
             for w in words[1:]:
                 if w not in STOP_WORDS and len(w) > 2 and w != words[0]:
                     fw_index[w].append(entry)
@@ -230,7 +242,9 @@ def build_indexes(db_paths: tuple):
     return exact, dict(fw_index), alias_exact, fts_conns, len(exact)
 
 
-# ─── FTS5 LOOKUP  (tier-4 fallback) ──────────────────────────────────────────
+# ─── FTS5 LOOKUP  (tier-5 fallback) ──────────────────────────────────────────
+# Searches the full FTS5 table — which indexes both company_name and aliases —
+# so alias-only matches (e.g. "IHRP") are also caught here as a safety net.
 def fts_lookup(norm_query: str, fts_conns: list) -> str:
     tokens = meaningful_tokens(norm_query)
     if not tokens or not fts_conns:
@@ -238,12 +252,13 @@ def fts_lookup(norm_query: str, fts_conns: list) -> str:
     fts_q = " AND ".join(f'"{t}"' for t in tokens)
     for conn in fts_conns:
         try:
+            # Querying the table name (not a column) searches ALL indexed columns
             row = conn.execute(
-                "SELECT uen FROM companies_fts WHERE company_name MATCH ? LIMIT 1",
+                "SELECT uen FROM companies_fts WHERE companies_fts MATCH ? LIMIT 1",
                 (fts_q,)
             ).fetchone()
             if row and row[0]:
-                return row[0].upper()   # ← ensure upper-case from FTS5 results too
+                return row[0].upper()
         except sqlite3.OperationalError:
             pass
     return ""
@@ -251,11 +266,17 @@ def fts_lookup(norm_query: str, fts_conns: list) -> str:
 
 # ─── FIND UEN ─────────────────────────────────────────────────────────────────
 #
-# Tier 1  exact dict              O(1)
-# Tier 2  fw_index substring      O(1) bucket + small list
-# Tier 3a alias_exact             O(1) exact alias hit
-# Tier 3b alias substring         same fw_index loop as tier-2 (no extra pass)
-# Tier 4  FTS5 on-disk            O(log N)
+# Tier 1  exact name dict              O(1)
+# Tier 2  exact alias dict             O(1)   ← checked right after tier-1.
+#                                              Previously this was checked only
+#                                              after fw_index scanning, causing
+#                                              alias-only queries (e.g. "IHRP")
+#                                              to fall all the way to FTS5 and
+#                                              still miss (old FTS5 had no
+#                                              aliases column).  Now fixed.
+# Tier 3  fw_index name substring      O(1) bucket + small list scan
+# Tier 4  fw_index alias substring     same loop as tier-3 (no extra pass)
+# Tier 5  FTS5 on-disk                 O(log N), searches name + aliases
 
 def find_uen(typed_name: str,
              exact: dict, fw_index: dict, alias_exact: dict,
@@ -265,16 +286,21 @@ def find_uen(typed_name: str,
     if not norm_query:
         return ""
 
-    # ── Tier 1: exact ────────────────────────────────────────────────────────
+    # ── Tier 1: exact name ───────────────────────────────────────────────────
     if norm_query in exact:
         return exact[norm_query]
+
+    # ── Tier 2: exact alias ──────────────────────────────────────────────────
+    # Must be checked here — before fw_index — so that a query which IS an alias
+    # but is NOT a substring of any official name (e.g. "IHRP") is caught at
+    # O(1) cost rather than falling through all tiers and being missed.
+    if norm_query in alias_exact:
+        return alias_exact[norm_query]
 
     nq_len = len(norm_query)
     best_uen, best_score = "", -1
 
-    # ── Tiers 2 + 3b: fw_index  ──────────────────────────────────────────────
-    # One pass over relevant buckets; checks both the official name (tier-2)
-    # and any aliases stored on the entry (tier-3b substring).
+    # ── Tiers 3 + 4: fw_index substring scan ─────────────────────────────────
     seen_cands: dict[str, tuple] = {}
     for w in norm_query.split():
         if w in fw_index:
@@ -286,7 +312,7 @@ def find_uen(typed_name: str,
     for norm_name, uen, alias_norms in seen_cands.values():
         en_len = len(norm_name)
 
-        # Tier 2: official name substring with ratio guard
+        # Tier 3: official name substring with ratio guard
         if nq_len <= en_len:
             sl, ratio, hit = nq_len, nq_len / en_len, norm_query in norm_name
         else:
@@ -295,9 +321,9 @@ def find_uen(typed_name: str,
             score = 5000 + sl
             if score > best_score:
                 best_score, best_uen = score, uen
-            continue  # tier-2 hit — skip alias check for this entry
+            continue  # skip alias check for this entry — name match is better
 
-        # Tier 3b: alias substring (only if entry has aliases)
+        # Tier 4: alias substring
         for alias in alias_norms:
             al_len = len(alias)
             if nq_len <= al_len:
@@ -308,22 +334,12 @@ def find_uen(typed_name: str,
                 score = 4000 + asl
                 if score > best_score:
                     best_score, best_uen = score, uen
-                break  # best alias match for this entry found
-
-    if best_score >= 5000:
-        return best_uen   # strong tier-2 hit, stop here
-
-    # ── Tier 3a: exact alias dict  ────────────────────────────────────────────
-    if norm_query in alias_exact:
-        candidate = alias_exact[norm_query]
-        # Score 4500 — better than alias substring (4000) but below name substring (5000)
-        if 4500 > best_score:
-            best_score, best_uen = 4500, candidate
+                break
 
     if best_score >= 4000:
         return best_uen
 
-    # ── Tier 4: FTS5 on-disk  ────────────────────────────────────────────────
+    # ── Tier 5: FTS5 on-disk ─────────────────────────────────────────────────
     fts_result = fts_lookup(norm_query, fts_conns)
     if fts_result:
         return fts_result
@@ -356,49 +372,46 @@ def process_df(df, name_col_idx, uen_col_idx, header_row_idx, end_row_1based,
         ru  = clean_val(row.iloc[uen_col_idx])  if uen_col_idx  < len(row) else ""
         tn, tu = rn.strip(), ru.strip()
 
-        # ── Both empty → NA ──────────────────────────────────────────────────
+        # Both empty → NA
         if not tn and not tu:
             result_df.at[i, nc] = "NA"; result_df.at[i, uc] = "NA"
             na_count += 1; continue
 
-        # ── Name empty, UEN is a placeholder → NA ────────────────────────────
-        # FIX: previously this branch was skipped because `if not tn: continue`
-        # fired before we could check whether the UEN was a placeholder.
+        # Name empty
         if not tn:
             if is_na(tu):
                 result_df.at[i, nc] = "NA"; result_df.at[i, uc] = "NA"
                 na_count += 1
-            # if UEN has real content but name is empty, leave the row alone
             continue
 
-        # ── Name is a placeholder → NA ───────────────────────────────────────
+        # Name is a placeholder → NA
         if is_na(tn):
             result_df.at[i, nc] = "NA"; result_df.at[i, uc] = "NA"
             na_count += 1; continue
 
-        # ── Name pasted into UEN column → look up ────────────────────────────
+        # Name pasted into UEN column → look up
         if tn.lower() == tu.lower():
             m = cached_find(tn); result_df.at[i, uc] = m
             replaced += bool(m); no_match += not bool(m); continue
 
-        # ── UEN is a placeholder → look up ───────────────────────────────────
+        # UEN is a placeholder → look up
         if is_na(tu):
             m = cached_find(tn); result_df.at[i, uc] = m
             filled += bool(m); no_match += not bool(m); continue
 
-        # ── UEN fails format check → replace ─────────────────────────────────
+        # UEN fails format check → replace
         if tu and not is_valid_uen(tu):
             m = cached_find(tn); result_df.at[i, uc] = m
             replaced += bool(m); no_match += not bool(m); continue
 
-        # ── Valid UEN present → keep (just fix case + trim) ──────────────────
+        # Valid UEN present → keep (normalise to uppercase)
         if tu and is_valid_uen(tu):
             canonical = tu.upper()
             if canonical != clean_val(row.iloc[uen_col_idx]):
                 result_df.at[i, uc] = canonical
             already += 1; continue
 
-        # ── UEN empty → look up ──────────────────────────────────────────────
+        # UEN empty → look up
         m = cached_find(tn); result_df.at[i, uc] = m
         filled += bool(m); no_match += not bool(m)
 
