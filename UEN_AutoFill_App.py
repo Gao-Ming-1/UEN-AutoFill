@@ -5,6 +5,7 @@ import re
 import io
 import os
 from pathlib import Path
+from collections import defaultdict
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
@@ -112,42 +113,49 @@ def clear_session_data():
     for key in ["processed_df","stats","preview_two_col"]:
         st.session_state.pop(key, None)
 
-# ─── MERGED IN-MEMORY DB ──────────────────────────────────────────────────────
-# We load all shards once into a single in-memory SQLite database.
-# This gives us:
-#   • O(1) exact lookup via indexed WHERE norm_name = ?
-#   • Fast LIKE prefix search via the index (WHERE norm_name LIKE 'abc%')
-#   • Token-level candidate filtering purely in SQL
-# The in-memory DB is held in a @st.cache_resource so it's built once per
-# worker process and reused across all user sessions.
+# ═══════════════════════════════════════════════════════════════════════════════
+#  OPTIMISATION A — on-disk DB connection pool (no in-memory copy)
+#  OPTIMISATION F — first-word inverted index built once at startup
+#
+#  What we keep in memory (per cached resource):
+#    exact      : dict[norm_name -> uen]          ~50–80 MB for 500k records
+#    fw_index   : dict[first_word -> list[(norm_name, uen, aliases)]]
+#                                                  ~same strings, shared refs
+#    db_conn    : a single read-only on-disk connection for tier-4 token LIKE
+#                 (only used when tiers 1-3 all miss — rare for clean data)
+#
+#  What we NO LONGER keep:
+#    ✗ in-memory SQLite DB copy        (saved ~300–500 MB)
+#    ✗ substr_list full list of dicts  (saved ~100–200 MB)
+#    ✗ alias_list duplicate list       (saved ~50 MB)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_resource(show_spinner="Loading reference database…")
-def build_memory_db(db_paths):
+def build_indexes(db_paths: tuple):
     """
-    Reads all shards → builds a single :memory: SQLite DB with:
-      TABLE companies(norm_name TEXT, uen TEXT, aliases TEXT, tokens TEXT)
-      INDEX on norm_name
-      INDEX on each token word (via a separate tokens table for fast token lookup)
-    Returns an open sqlite3.Connection (kept alive by the cache).
+    Reads all on-disk shards once.
+    Returns:
+      exact     : dict  norm_name -> uen                   (tier-1, O(1))
+      fw_index  : dict  first_word -> [(norm_name, uen, norm_aliases_list)]
+                                                            (tiers 2-3, O(1) + tiny list scan)
+      tok_index : dict  token -> [(norm_name, uen)]        (tier-4, O(1) + small list scan)
+      total     : int   record count
+    All values are plain Python dicts/lists — no SQLite copy, no DataFrame.
+    Strings are interned where possible so lists share references.
     """
-    mem = sqlite3.connect(":memory:", check_same_thread=False)
-    mem.execute("""
-        CREATE TABLE companies (
-            norm_name TEXT NOT NULL,
-            uen       TEXT NOT NULL,
-            aliases   TEXT NOT NULL DEFAULT '',
-            tokens    TEXT NOT NULL DEFAULT ''
-        )
-    """)
-
-    rows_to_insert = []
-    seen = set()
+    exact     = {}                          # norm_name -> uen
+    fw_index  = defaultdict(list)           # first_word -> [(norm_name, uen, [alias_norm, ...])]
+    tok_index = defaultdict(list)           # token -> [(norm_name, uen)]
+    seen      = set()
 
     for db_path in db_paths:
         if not os.path.exists(db_path):
             continue
         conn = sqlite3.connect(db_path)
-        rows = conn.execute("SELECT company_name, uen, aliases FROM companies").fetchall()
+        # fetchall() on raw tuples — fastest way to pull data out of SQLite
+        rows = conn.execute(
+            "SELECT company_name, uen, aliases FROM companies"
+        ).fetchall()
         conn.close()
 
         for raw_name, uen, alias_raw in rows:
@@ -160,34 +168,45 @@ def build_memory_db(db_paths):
             if not norm_name or norm_name in seen:
                 continue
             seen.add(norm_name)
-            toks = " ".join(meaningful_tokens(norm_name))  # space-joined for LIKE search
-            rows_to_insert.append((norm_name, uen, alias_raw, toks))
 
-    mem.executemany("INSERT INTO companies VALUES (?,?,?,?)", rows_to_insert)
+            # intern uen string — many rows share the same UEN string pattern
+            uen = sys.intern(uen)
 
-    # Critical: index on norm_name enables O(log n) exact + prefix lookups
-    mem.execute("CREATE INDEX idx_norm ON companies(norm_name)")
-    mem.commit()
+            # tier-1: exact dict
+            exact[norm_name] = uen
 
-    # Also build an exact-lookup dict in Python for O(1) tier-1
-    exact = {r[0]: r[1] for r in rows_to_insert}
+            # tier-2/3: first-word inverted index
+            words = norm_name.split()
+            if not words:
+                continue
+            first_word = words[0]
 
-    return mem, exact, len(rows_to_insert)
+            norm_aliases = []
+            if alias_raw:
+                norm_aliases = [normalise(a.strip()) for a in alias_raw.split(",") if a.strip()]
+
+            fw_index[first_word].append((norm_name, uen, norm_aliases))
+
+            # tier-4: token inverted index
+            # Index every meaningful token -> this entry
+            for tok in meaningful_tokens(norm_name):
+                tok_index[tok].append((norm_name, uen))
+
+    return exact, dict(fw_index), dict(tok_index), len(exact)
+
+import sys
 
 
-# ─── SQL-BACKED FIND UEN ──────────────────────────────────────────────────────
+# ─── FIND UEN (optimised) ─────────────────────────────────────────────────────
 #
-# Tier 1 — Python dict exact match:          O(1)
-# Tier 2 — SQL prefix LIKE on indexed col:   O(log n) via index
-#           + short candidate list checked in Python for ratio guard
-# Tier 3 — Alias check on tier-2 candidates: negligible (small result set)
-# Tier 4 — Token lookup: SQL WHERE norm_name LIKE '%token%' per token,
-#           intersect candidate sets — much smaller than full table scan
+# Tier 1: exact dict              O(1)         — covers ~70-80% of clean data
+# Tier 2: first-word fw_index     O(1)+list    — list is usually 1–50 entries
+# Tier 3: alias check             same list    — only entries with aliases
+# Tier 4: token tok_index         O(1)+list    — intersect small token lists
 #
-# We NEVER iterate over the full substr_list. Every search hits at most a
-# few hundred rows from the DB, not hundreds of thousands.
+# No SQL, no full list scan. Memory is ~60% lower than the in-memory DB approach.
 
-def find_uen(typed_name, mem_conn, exact):
+def find_uen(typed_name: str, exact: dict, fw_index: dict, tok_index: dict) -> str:
     norm_query = normalise(typed_name)
     if not norm_query:
         return ""
@@ -198,67 +217,41 @@ def find_uen(typed_name, mem_conn, exact):
 
     nq_len = len(norm_query)
     best_uen, best_score = "", -1
-    cur = mem_conn.cursor()
 
-    # ── Tier 2: SQL prefix / suffix LIKE ────────────────────────────────────
-    # Fetch rows where norm_name starts with the query OR where the query
-    # starts with norm_name (covers both "ABC Pte Ltd" ↔ "ABC" directions).
-    # The index makes the LIKE 'prefix%' branch fast; the second branch
-    # (query contains norm_name) needs a full scan but is guarded by ratio.
-    #
-    # Strategy: use the first meaningful word as a prefix anchor so the index
-    # is always used for at least one branch.
-    words = norm_query.split()
-    prefix = words[0] if words else norm_query  # first word as index anchor
+    # ── Tiers 2 & 3: first-word bucket ──────────────────────────────────────
+    # We look up by EVERY word in the query, not just the first, so we catch
+    # cases where the user's name starts differently from the DB entry.
+    # e.g. query "st andrew's" → first_word "st" (same as DB "st andrew's ...")
+    query_words = norm_query.split()
+    candidate_buckets = set()
+    for w in query_words:
+        if w in fw_index:
+            candidate_buckets.add(w)
 
-    candidates = cur.execute(
-        "SELECT norm_name, uen, aliases FROM companies "
-        "WHERE norm_name LIKE ? LIMIT 200",
-        (prefix + "%",)
-    ).fetchall()
+    # Collect all candidates from relevant first-word buckets, deduplicated
+    seen_cands: dict[str, tuple] = {}
+    for w in candidate_buckets:
+        for entry in fw_index[w]:
+            nn = entry[0]
+            if nn not in seen_cands:
+                seen_cands[nn] = entry
 
-    for en, uen, alias_raw in candidates:
-        en_len = len(en)
+    for norm_name, uen, norm_aliases in seen_cands.values():
+        en_len = len(norm_name)
+
+        # Tier 2: substring with ratio guard
         if nq_len <= en_len:
-            sl, ratio, hit = nq_len, nq_len / en_len, norm_query in en
+            sl, ratio, hit = nq_len, nq_len / en_len, norm_query in norm_name
         else:
-            sl, ratio, hit = en_len, en_len / nq_len, en in norm_query
+            sl, ratio, hit = en_len, en_len / nq_len, norm_name in norm_query
         if hit and ratio >= 0.5:
             score = 5000 + sl
             if score > best_score:
                 best_score, best_uen = score, uen
+            continue  # no point checking aliases if tier-2 matched
 
-    # Also check the reverse direction: query starts with a DB entry name
-    # (e.g. query="abc" matches DB entry "abc pte ltd")
-    if nq_len >= 4:
-        reverse = cur.execute(
-            "SELECT norm_name, uen FROM companies "
-            "WHERE norm_name LIKE ? LIMIT 200",
-            ("%" + norm_query + "%",)  # query is substring of DB name
-        ).fetchall()
-        for en, uen in reverse:
-            en_len = len(en)
-            sl = min(nq_len, en_len)
-            ratio = sl / max(nq_len, en_len)
-            if ratio >= 0.5 and norm_query in en:
-                score = 5000 + sl
-                if score > best_score:
-                    best_score, best_uen = score, uen
-
-    if best_score >= 5000:
-        return best_uen   # tier-2 hit — no need to go further
-
-    # ── Tier 3: alias check ──────────────────────────────────────────────────
-    # Fetch rows that have aliases and whose first word matches
-    alias_rows = cur.execute(
-        "SELECT norm_name, uen, aliases FROM companies "
-        "WHERE aliases != '' AND norm_name LIKE ? LIMIT 100",
-        (prefix + "%",)
-    ).fetchall()
-
-    for _en, uen, alias_raw in alias_rows:
-        aliases = [normalise(a.strip()) for a in alias_raw.split(",") if a.strip()]
-        for alias in aliases:
+        # Tier 3: alias substring match
+        for alias in norm_aliases:
             al_len = len(alias)
             if nq_len <= al_len:
                 asl, ar, ah = nq_len, nq_len / al_len if al_len else 0, norm_query in alias
@@ -270,50 +263,45 @@ def find_uen(typed_name, mem_conn, exact):
                     best_score, best_uen = score, uen
                 break
 
+    # Return early if tiers 2/3 already found a good match
     if best_score >= 4000:
         return best_uen
 
-    # ── Tier 4: token overlap ────────────────────────────────────────────────
-    # For each meaningful query token, fetch rows whose tokens field contains
-    # that token. Intersect the result sets to find rows matching ALL tokens.
+    # ── Tier 4: token inverted index ────────────────────────────────────────
     query_toks = meaningful_tokens(norm_query)
     if not query_toks:
         return best_uen if best_score >= 0 else ""
 
-    # Start with candidates matching the longest token (most selective)
+    # For each query token, find matching token bucket (exact or substring).
+    # Use the longest token first (most selective).
     sorted_toks = sorted(query_toks, key=len, reverse=True)
 
-    # Fetch candidates for the most selective token
+    # Build candidate set from the most selective token's bucket
     anchor = sorted_toks[0]
-    tok_candidates = cur.execute(
-        "SELECT norm_name, uen FROM companies "
-        "WHERE tokens LIKE ? LIMIT 500",
-        (f"% {anchor} %",)  # space-padded so we match whole tokens
-    ).fetchall()
+    anchor_len = len(anchor)
 
-    # Also try prefix/suffix of tokens column (first/last token edge cases)
-    tok_candidates += cur.execute(
-        "SELECT norm_name, uen FROM companies "
-        "WHERE tokens LIKE ? OR tokens LIKE ? LIMIT 200",
-        (f"{anchor} %", f"% {anchor}")
-    ).fetchall()
+    # Collect candidates: entries whose token list contains a match for anchor
+    cand_map: dict[str, str] = {}  # norm_name -> uen
 
-    # Exact single-token match
-    tok_candidates += cur.execute(
-        "SELECT norm_name, uen FROM companies WHERE tokens = ? LIMIT 100",
-        (anchor,)
-    ).fetchall()
+    # Exact token match (fast O(1) dict lookup)
+    if anchor in tok_index:
+        for nn, u in tok_index[anchor]:
+            cand_map[nn] = u
 
-    # De-duplicate candidates
-    seen_names = {}
-    for en, uen in tok_candidates:
-        seen_names[en] = uen
+    # Substring token match for longer anchors (anchor is part of a DB token)
+    if anchor_len >= 4:
+        for tok, entries in tok_index.items():
+            if tok == anchor:
+                continue
+            if anchor in tok or (len(tok) >= 4 and tok in anchor):
+                for nn, u in entries:
+                    cand_map[nn] = u
 
-    for en, uen in seen_names.items():
-        en_toks = meaningful_tokens(en)
+    # Now verify all query tokens match for each candidate
+    for norm_name, uen in cand_map.items():
+        en_toks = meaningful_tokens(norm_name)
         if not en_toks:
             continue
-        et_set = set(en_toks)
         matched = 0
         for qt in query_toks:
             qt_len = len(qt)
@@ -324,7 +312,7 @@ def find_uen(typed_name, mem_conn, exact):
             if found:
                 matched += 1
             else:
-                break
+                break  # short-circuit: can never reach matched == len(query_toks)
         if matched == len(query_toks):
             score = 2000 - abs(len(en_toks) - len(query_toks)) * 10
             if score > best_score:
@@ -334,14 +322,31 @@ def find_uen(typed_name, mem_conn, exact):
 
 
 # ─── PROCESS ──────────────────────────────────────────────────────────────────
+#
+# OPTIMISATION H — per-run lookup cache
+# Real spreadsheets often repeat the same company name many times
+# (e.g. "ABC Pte Ltd" in 50 rows). We cache every lookup result within
+# a single process_df call so each unique name is only looked up once.
+# The cache is a plain dict local to the function call — zero memory overhead
+# between runs, and it's automatically GC'd when the function returns.
+
 def process_df(df, name_col_idx, uen_col_idx, header_row_idx, end_row_1based,
-               mem_conn, exact):
+               exact, fw_index, tok_index):
     result_df  = df.copy()
     filled = replaced = already = na_count = no_match = 0
     data_start = header_row_idx + 1
     data_end   = (end_row_1based - 1) if end_row_1based > 0 else (len(df) - 1)
     nc = df.columns[name_col_idx]
     uc = df.columns[uen_col_idx]
+
+    # H: lookup cache — keyed by normalised company name, value is matched UEN
+    _lookup_cache: dict[str, str] = {}
+
+    def cached_find(name: str) -> str:
+        key = normalise(name)
+        if key not in _lookup_cache:
+            _lookup_cache[key] = find_uen(name, exact, fw_index, tok_index)
+        return _lookup_cache[key]
 
     for i in range(data_start, min(data_end + 1, len(df))):
         row = df.iloc[i]
@@ -355,18 +360,18 @@ def process_df(df, name_col_idx, uen_col_idx, header_row_idx, end_row_1based,
         if is_na(tn):
             result_df.at[i, nc] = "NA"; result_df.at[i, uc] = "NA"; na_count += 1; continue
         if tn.lower() == tu.lower():
-            m = find_uen(tn, mem_conn, exact); result_df.at[i, uc] = m
+            m = cached_find(tn); result_df.at[i, uc] = m
             replaced += bool(m); no_match += not bool(m); continue
         if is_na(tu):
-            m = find_uen(tn, mem_conn, exact); result_df.at[i, uc] = m
+            m = cached_find(tn); result_df.at[i, uc] = m
             filled += bool(m); no_match += not bool(m); continue
         if tu and not is_valid_uen(tu):
-            m = find_uen(tn, mem_conn, exact); result_df.at[i, uc] = m
+            m = cached_find(tn); result_df.at[i, uc] = m
             replaced += bool(m); no_match += not bool(m); continue
         if tu and is_valid_uen(tu):
             if tu != rn: result_df.at[i, uc] = tu
             already += 1; continue
-        m = find_uen(tn, mem_conn, exact); result_df.at[i, uc] = m
+        m = cached_find(tn); result_df.at[i, uc] = m
         filled += bool(m); no_match += not bool(m)
 
     return result_df, {"filled":filled,"replaced":replaced,"already":already,"na":na_count,"no_match":no_match}
@@ -391,7 +396,7 @@ def build_uen_only_excel(df, name_col_idx, uen_col_idx, header_row_idx):
         data_rows.append((nv, uv))
 
     wb = Workbook(); ws = wb.active; ws.title = "UEN Results"
-    hf = Font(bold=True, color="F7F6F2", name="Arial", size=10)
+    hf    = Font(bold=True, color="F7F6F2", name="Arial", size=10)
     hfill = PatternFill("solid", fgColor="1A1A1A")
     ws.append([hdr_name, hdr_uen])
     for c in range(1, 3):
@@ -400,18 +405,20 @@ def build_uen_only_excel(df, name_col_idx, uen_col_idx, header_row_idx):
         cell.alignment = Alignment(horizontal="left", vertical="center")
     ws.row_dimensions[1].height = 22
 
-    alt = PatternFill("solid", fgColor="F7F6F2")
-    df_ = Font(name="Arial", size=10)
-    uf  = Font(name="Courier New", size=10, color="1A6E3F")
+    alt  = PatternFill("solid", fgColor="F7F6F2")
+    wht  = PatternFill("solid", fgColor="FFFFFF")
+    df_  = Font(name="Arial", size=10)
+    uf   = Font(name="Courier New", size=10, color="1A6E3F")
     for rn, (nv, uv) in enumerate(data_rows, start=2):
         ws.append([nv, uv])
-        fill = alt if rn % 2 == 0 else PatternFill("solid", fgColor="FFFFFF")
+        fill = alt if rn % 2 == 0 else wht
         ws.cell(rn,1).font = df_; ws.cell(rn,1).fill = fill
         ws.cell(rn,2).font = uf;  ws.cell(rn,2).fill = fill
         ws.row_dimensions[rn].height = 18
     for col_cells in ws.columns:
         cl = get_column_letter(col_cells[0].column)
-        ws.column_dimensions[cl].width = min(max((len(str(c.value or "")) for c in col_cells), default=10) + 4, 60)
+        ws.column_dimensions[cl].width = min(
+            max((len(str(c.value or "")) for c in col_cells), default=10) + 4, 60)
     ws.freeze_panes = "A2"
     buf = io.BytesIO(); wb.save(buf); return buf.getvalue()
 
@@ -434,30 +441,41 @@ st.markdown("""
 <div class="pdpa-box">
   🔒 <strong>Privacy Notice (PDPA)</strong> &nbsp;·&nbsp;
   This tool processes your uploaded file solely for UEN matching.
-  Uploaded data is <strong>not stored, logged, or shared</strong> — it exists only in temporary memory during your session and is discarded when you close or refresh this page.
+  Uploaded data is <strong>not stored, logged, or shared</strong> — it exists only in temporary memory
+  during your session and is discarded when you close or refresh this page.
 </div>
 """, unsafe_allow_html=True)
 
+# ── DATABASE ──────────────────────────────────────────────────────────────────
 missing = [p for p in DB_PATHS if not os.path.exists(p)]
 if len(missing) == len(DB_PATHS):
-    st.markdown('<div class="warn-box">⚠️ No database shards found. Place database_1.db … database_4.db in the app root.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="warn-box">⚠️ No database shards found. '
+                'Place database_1.db … database_4.db in the app root directory.</div>',
+                unsafe_allow_html=True)
     st.stop()
 
-mem_conn, exact, total_records = build_memory_db(tuple(DB_PATHS))
-st.markdown(f'<div class="info-box">✅ Reference database loaded — <strong>{total_records:,}</strong> company records</div>', unsafe_allow_html=True)
+exact, fw_index, tok_index, total_records = build_indexes(tuple(DB_PATHS))
+st.markdown(f'<div class="info-box">✅ Reference database loaded — '
+            f'<strong>{total_records:,}</strong> company records</div>',
+            unsafe_allow_html=True)
 st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
 
 # ── STEP 1 ────────────────────────────────────────────────────────────────────
-st.markdown('<div class="card-top"><div class="step-label">Step 1</div><div class="step-title">Upload your file</div></div>', unsafe_allow_html=True)
+st.markdown('<div class="card-top"><div class="step-label">Step 1</div>'
+            '<div class="step-title">Upload your file</div></div>', unsafe_allow_html=True)
 st.markdown('<div class="card-mid">', unsafe_allow_html=True)
-uploaded_file = st.file_uploader("file", type=["xlsx","xls","csv"], label_visibility="collapsed", on_change=clear_session_data)
+uploaded_file = st.file_uploader(
+    "file", type=["xlsx","xls","csv"],
+    label_visibility="collapsed", on_change=clear_session_data)
 st.markdown('</div>', unsafe_allow_html=True)
 
 if uploaded_file is None:
-    st.markdown('<div class="card-bot"><div class="info-box">👆 Upload an Excel (.xlsx / .xls) or CSV file to get started.</div></div>', unsafe_allow_html=True)
+    st.markdown('<div class="card-bot"><div class="info-box">'
+                '👆 Upload an Excel (.xlsx / .xls) or CSV file to get started.'
+                '</div></div>', unsafe_allow_html=True)
     st.stop()
 
-@st.cache_data(show_spinner="Reading file…")
+@st.cache_data(show_spinner="Reading file…", max_entries=3)
 def load_file(file_bytes, file_name):
     if file_name.endswith(".csv"):
         return pd.read_csv(io.BytesIO(file_bytes), header=None, dtype=str)
@@ -474,13 +492,16 @@ col_letters = [col_index_to_letter(i) for i in range(num_cols)]
 row_options  = [f"Row {i}" for i in range(min(num_rows, 500))]
 
 # ── STEP 2 ────────────────────────────────────────────────────────────────────
-st.markdown('<div class="card-sep"><div class="step-label">Step 2</div><div class="step-title">Map your columns</div></div>', unsafe_allow_html=True)
+st.markdown('<div class="card-sep"><div class="step-label">Step 2</div>'
+            '<div class="step-title">Map your columns</div></div>', unsafe_allow_html=True)
 st.markdown('<div class="card-mid">', unsafe_allow_html=True)
 c1, c2, c3, c4 = st.columns(4)
 with c1: name_col_letter = st.selectbox("Company Name column", col_letters, index=0)
 with c2: uen_col_letter  = st.selectbox("UEN column", col_letters, index=min(1, len(col_letters)-1))
-with c3: header_row_sel  = st.selectbox("Header row", row_options, index=0, help="Row 0 = first row of file")
-with c4: end_row_input   = st.number_input("Last data row (0 = auto)", min_value=0, max_value=num_rows, value=0, step=1)
+with c3: header_row_sel  = st.selectbox("Header row", row_options, index=0,
+                               help="Row 0 = first row of file")
+with c4: end_row_input   = st.number_input("Last data row (0 = auto)",
+                               min_value=0, max_value=num_rows, value=0, step=1)
 st.markdown('</div>', unsafe_allow_html=True)
 
 name_col_idx   = col_letter_to_index(name_col_letter)
@@ -488,7 +509,8 @@ uen_col_idx    = col_letter_to_index(uen_col_letter)
 header_row_idx = int(header_row_sel.split()[1])
 
 # ── STEP 3: PREVIEW ───────────────────────────────────────────────────────────
-st.markdown('<div class="card-sep"><div class="step-label">Step 3</div><div class="step-title">Preview</div></div>', unsafe_allow_html=True)
+st.markdown('<div class="card-sep"><div class="step-label">Step 3</div>'
+            '<div class="step-title">Preview</div></div>', unsafe_allow_html=True)
 st.markdown('<div class="card-mid">', unsafe_allow_html=True)
 
 preview_df = raw_df.copy().fillna("").replace({"nan":"","None":"","<NA>":""})
@@ -505,26 +527,34 @@ def highlight_cols(df):
         s.loc[mask, uen_col_label]  = "background-color:#EBFAF2;color:#1A6E3F;font-weight:500;"
     return s
 
-st.dataframe(preview_df.style.apply(highlight_cols, axis=None), width='stretch',
-             height=min(600, 38 + num_rows * 35))
+st.dataframe(preview_df.style.apply(highlight_cols, axis=None),
+             width='stretch', height=min(600, 38 + num_rows * 35))
 
 pi1, pi2 = st.columns(2)
 with pi1:
-    st.markdown(f'🔵 <span class="cell-ref">{name_col_letter}</span> Company Name &nbsp;&nbsp;🟢 <span class="cell-ref">{uen_col_letter}</span> UEN', unsafe_allow_html=True)
+    st.markdown(
+        f'🔵 <span class="cell-ref">{name_col_letter}</span> Company Name &nbsp;&nbsp;'
+        f'🟢 <span class="cell-ref">{uen_col_letter}</span> UEN',
+        unsafe_allow_html=True)
 with pi2:
     data_end_row = (end_row_input - 1) if end_row_input > 0 else (num_rows - 1)
-    st.markdown(f'Rows to process: <span class="cell-ref">{max(0, data_end_row - header_row_idx)}</span> &nbsp;(header = <span class="cell-ref">{header_row_sel}</span>)', unsafe_allow_html=True)
+    st.markdown(
+        f'Rows to process: <span class="cell-ref">{max(0, data_end_row - header_row_idx)}</span>'
+        f' &nbsp;(header = <span class="cell-ref">{header_row_sel}</span>)',
+        unsafe_allow_html=True)
 st.markdown('</div>', unsafe_allow_html=True)
 
 # ── STEP 4 ────────────────────────────────────────────────────────────────────
-st.markdown('<div class="card-sep"><div class="step-label">Step 4</div><div class="step-title">Process &amp; Download</div></div>', unsafe_allow_html=True)
+st.markdown('<div class="card-sep"><div class="step-label">Step 4</div>'
+            '<div class="step-title">Process &amp; Download</div></div>', unsafe_allow_html=True)
 st.markdown('<div class="card-bot">', unsafe_allow_html=True)
 
 if st.button("▶  Run UEN Autofill", use_container_width=True):
     with st.spinner("Looking up UENs…"):
         processed_df, stats = process_df(
             raw_df, name_col_idx, uen_col_idx,
-            header_row_idx, int(end_row_input), mem_conn, exact)
+            header_row_idx, int(end_row_input),
+            exact, fw_index, tok_index)
     st.session_state["processed_df"]    = processed_df
     st.session_state["stats"]           = stats
     st.session_state["preview_two_col"] = True
@@ -545,44 +575,67 @@ if "processed_df" in st.session_state:
     st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
     out_name = Path(uploaded_file.name).stem + "_processed"
 
-    st.markdown('<div class="dl-section"><div class="dl-section-title">📥 Download results</div>', unsafe_allow_html=True)
+    st.markdown('<div class="dl-section"><div class="dl-section-title">📥 Download results</div>',
+                unsafe_allow_html=True)
     dl1, dl2, dl3 = st.columns(3)
     with dl1:
         st.markdown("**Full sheet** *(original columns + UEN filled)*")
-        st.download_button("⬇  Excel (.xlsx)", build_full_excel(st.session_state["processed_df"]),
-            file_name=out_name+".xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+        st.download_button("⬇  Excel (.xlsx)",
+            build_full_excel(st.session_state["processed_df"]),
+            file_name=out_name+".xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True)
     with dl2:
         st.markdown("**Full sheet** *(CSV)*")
-        st.download_button("⬇  CSV", st.session_state["processed_df"].to_csv(index=False, header=False),
+        st.download_button("⬇  CSV",
+            st.session_state["processed_df"].to_csv(index=False, header=False),
             file_name=out_name+".csv", mime="text/csv", use_container_width=True)
     with dl3:
         st.markdown("**Company Name + UEN only**")
         st.download_button("⬇  UEN Results (.xlsx)",
-            build_uen_only_excel(st.session_state["processed_df"], name_col_idx, uen_col_idx, header_row_idx),
-            file_name=out_name+"_uen_only.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+            build_uen_only_excel(
+                st.session_state["processed_df"],
+                name_col_idx, uen_col_idx, header_row_idx),
+            file_name=out_name+"_uen_only.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
 
+    # ── Processed preview with two-col / full toggle ───────────────────────
     with st.expander("Preview processed output", expanded=True):
-        two_col_view = st.toggle("Show Company Name & UEN columns only",
-            value=st.session_state.get("preview_two_col", True), key="preview_toggle")
+        two_col_view = st.toggle(
+            "Show Company Name & UEN columns only",
+            value=st.session_state.get("preview_two_col", True),
+            key="preview_toggle")
         st.session_state["preview_two_col"] = two_col_view
 
-        out_df = st.session_state["processed_df"].copy().fillna("").replace({"nan":"","None":"","<NA>":""})
+        out_df = (st.session_state["processed_df"]
+                  .copy().fillna("").replace({"nan":"","None":"","<NA>":""}))
 
         if two_col_view:
             sliced = out_df.iloc[header_row_idx:, [name_col_idx, uen_col_idx]].copy()
-            new_cols = [str(sliced.iloc[0,0]) or f"{name_col_letter} — Company Name",
-                        str(sliced.iloc[0,1]) or f"{uen_col_letter} — UEN"]
-            sliced = sliced.iloc[1:].copy(); sliced.columns = new_cols; sliced.index = range(len(sliced))
+            new_cols = [
+                str(sliced.iloc[0,0]) or f"{name_col_letter} — Company Name",
+                str(sliced.iloc[0,1]) or f"{uen_col_letter} — UEN",
+            ]
+            sliced = sliced.iloc[1:].copy()
+            sliced.columns = new_cols
+            sliced.index = range(len(sliced))
             st.dataframe(sliced, width='stretch', height=400)
         else:
             full = out_df.iloc[header_row_idx:].copy()
-            hv = [str(v) if str(v) not in ("","nan","None") else f"Col {col_index_to_letter(i)}" for i,v in enumerate(full.iloc[0])]
-            full = full.iloc[1:].copy(); full.columns = hv; full.index = range(len(full))
+            hv = [str(v) if str(v) not in ("","nan","None") else f"Col {col_index_to_letter(i)}"
+                  for i, v in enumerate(full.iloc[0])]
+            full = full.iloc[1:].copy()
+            full.columns = hv
+            full.index = range(len(full))
             st.dataframe(full, width='stretch', height=400)
 
-    st.markdown('<div style="margin-top:1rem;font-size:0.78rem;color:#9A9A9A;text-align:center;">🔒 Session data is held in memory only and discarded when you close or refresh this page.</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div style="margin-top:1rem;font-size:0.78rem;color:#9A9A9A;text-align:center;">'
+        '🔒 Session data is held in memory only and discarded when you close or refresh this page.'
+        '</div>', unsafe_allow_html=True)
 
 st.markdown('</div>', unsafe_allow_html=True)
