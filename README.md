@@ -4,6 +4,10 @@ A Streamlit web app that automatically looks up and fills in **Unique Entity Num
 
 Upload a spreadsheet → map your columns → download with UENs filled in.
 
+<img width="1412" height="930" alt="image" src="https://github.com/user-attachments/assets/7f81f7f7-8f53-4e14-b543-0a8eb9dd2e00" />
+
+Link: https://uen-autofill-nto7nhlwmw55wfu5nvvwqe.streamlit.app/
+
 ---
 
 ## What it does
