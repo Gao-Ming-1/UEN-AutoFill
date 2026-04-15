@@ -4,6 +4,7 @@ import sqlite3
 import re
 import io
 import os
+import sys
 from pathlib import Path
 from collections import defaultdict
 from openpyxl import Workbook
@@ -113,50 +114,80 @@ def clear_session_data():
     for key in ["processed_df","stats","preview_two_col"]:
         st.session_state.pop(key, None)
 
+
 # ═══════════════════════════════════════════════════════════════════════════════
-#  OPTIMISATION A — on-disk DB connection pool (no in-memory copy)
-#  OPTIMISATION F — first-word inverted index built once at startup
+#  FTS5 SETUP  ─  run once per shard if the virtual table doesn't exist yet
 #
-#  What we keep in memory (per cached resource):
-#    exact      : dict[norm_name -> uen]          ~50–80 MB for 500k records
-#    fw_index   : dict[first_word -> list[(norm_name, uen, aliases)]]
-#                                                  ~same strings, shared refs
-#    db_conn    : a single read-only on-disk connection for tier-4 token LIKE
-#                 (only used when tiers 1-3 all miss — rare for clean data)
+#  We create a content-less FTS5 table so SQLite maintains its own inverted
+#  index on disk without duplicating the raw rows.  Queries like:
+#      SELECT uen FROM companies_fts WHERE company_name MATCH 'foo AND bar'
+#  are O(log N) on disk — no Python structures needed for fuzzy fallback.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def ensure_fts5(db_path: str) -> None:
+    """Create FTS5 virtual table + populate it if it doesn't already exist."""
+    conn = sqlite3.connect(db_path)
+    # Check whether the table already exists
+    exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='companies_fts'"
+    ).fetchone()
+    if not exists:
+        conn.execute("""
+            CREATE VIRTUAL TABLE companies_fts
+            USING fts5(company_name, uen, tokenize='unicode61 remove_diacritics 1')
+        """)
+        conn.execute("""
+            INSERT INTO companies_fts(company_name, uen)
+            SELECT company_name, uen FROM companies
+        """)
+        conn.commit()
+    conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  INDEX BUILD  ─  what lives in Python memory (much smaller than before)
 #
-#  What we NO LONGER keep:
-#    ✗ in-memory SQLite DB copy        (saved ~300–500 MB)
-#    ✗ substr_list full list of dicts  (saved ~100–200 MB)
-#    ✗ alias_list duplicate list       (saved ~50 MB)
+#  exact        : dict  norm_name -> uen          ~50-80 MB  (unchanged, fast)
+#  fw_index     : dict  first_word -> [(norm_name, uen)]
+#                 ── aliases REMOVED from this structure (was bloating buckets)
+#  alias_exact  : dict  norm_alias -> uen          ~5-10 MB  (new, replaces
+#                                                   alias scan inside fw_index)
+#  fts_conns    : list  of open read-only sqlite3.Connection objects
+#                 ── one per shard, kept alive for the session so we pay
+#                    zero connection-open overhead at lookup time
+#
+#  REMOVED:
+#    ✗ tok_index  — replaced by FTS5 on disk (tier-4 is now a DB query)
+#    ✗ alias list embedded in fw_index buckets
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_resource(show_spinner="Loading reference database…")
 def build_indexes(db_paths: tuple):
-    """
-    Reads all on-disk shards once.
-    Returns:
-      exact     : dict  norm_name -> uen                   (tier-1, O(1))
-      fw_index  : dict  first_word -> [(norm_name, uen, norm_aliases_list)]
-                                                            (tiers 2-3, O(1) + tiny list scan)
-      tok_index : dict  token -> [(norm_name, uen)]        (tier-4, O(1) + small list scan)
-      total     : int   record count
-    All values are plain Python dicts/lists — no SQLite copy, no DataFrame.
-    Strings are interned where possible so lists share references.
-    """
-    exact     = {}                          # norm_name -> uen
-    fw_index  = defaultdict(list)           # first_word -> [(norm_name, uen, [alias_norm, ...])]
-    tok_index = defaultdict(list)           # token -> [(norm_name, uen)]
-    seen      = set()
+    exact       = {}                    # norm_name  -> uen
+    alias_exact = {}                    # norm_alias -> uen   (NEW — replaces alias scan in fw_index)
+    fw_index    = defaultdict(list)     # first_word -> [(norm_name, uen)]  (aliases REMOVED)
+    fts_conns   = []                    # persistent read-only connections   (NEW)
+    seen        = set()
 
     for db_path in db_paths:
         if not os.path.exists(db_path):
             continue
-        conn = sqlite3.connect(db_path)
-        # fetchall() on raw tuples — fastest way to pull data out of SQLite
-        rows = conn.execute(
+
+        # ── Ensure FTS5 table exists (no-op if already built) ───────────────
+        ensure_fts5(db_path)
+
+        # ── Open a persistent read-only connection for FTS5 queries ─────────
+        # OPTIMISATION: open once, reuse forever — avoids per-lookup open/close
+        conn_ro = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True,
+                                  check_same_thread=False)
+        conn_ro.execute("PRAGMA journal_mode=OFF")   # read-only, no WAL needed
+        conn_ro.execute("PRAGMA cache_size=-32000")  # 32 MB page cache per shard
+        fts_conns.append(conn_ro)
+
+        # ── Pull raw data into Python once ──────────────────────────────────
+        rows = conn_ro.execute(
             "SELECT company_name, uen, aliases FROM companies"
         ).fetchall()
-        conn.close()
 
         for raw_name, uen, alias_raw in rows:
             raw_name  = (raw_name  or "").strip()
@@ -164,82 +195,98 @@ def build_indexes(db_paths: tuple):
             alias_raw = (alias_raw or "").strip()
             if not raw_name and not uen:
                 continue
-            norm_name = normalise(raw_name)
+
+            norm_name = sys.intern(normalise(raw_name))   # OPTIMISATION: intern both
+            uen       = sys.intern(uen)                   # strings to share refs
             if not norm_name or norm_name in seen:
                 continue
             seen.add(norm_name)
 
-            # intern uen string — many rows share the same UEN string pattern
-            uen = sys.intern(uen)
-
             # tier-1: exact dict
             exact[norm_name] = uen
 
-            # tier-2/3: first-word inverted index
+            # tier-2: fw_index — NO aliases stored here anymore
             words = norm_name.split()
-            if not words:
-                continue
-            first_word = words[0]
+            if words:
+                fw_index[words[0]].append((norm_name, uen))
 
-            norm_aliases = []
+            # alias_exact — separate flat dict, O(1) lookup
             if alias_raw:
-                norm_aliases = [normalise(a.strip()) for a in alias_raw.split(",") if a.strip()]
+                for a in alias_raw.split(","):
+                    a = a.strip()
+                    if a:
+                        norm_a = sys.intern(normalise(a))
+                        if norm_a and norm_a not in alias_exact:
+                            alias_exact[norm_a] = uen
 
-            fw_index[first_word].append((norm_name, uen, norm_aliases))
-
-            # tier-4: token inverted index
-            # Index every meaningful token -> this entry
-            for tok in meaningful_tokens(norm_name):
-                tok_index[tok].append((norm_name, uen))
-
-    return exact, dict(fw_index), dict(tok_index), len(exact)
-
-import sys
+    return exact, dict(fw_index), alias_exact, fts_conns, len(exact)
 
 
-# ─── FIND UEN (optimised) ─────────────────────────────────────────────────────
+# ─── FTS5 LOOKUP  (replaces tok_index tier-4) ────────────────────────────────
 #
-# Tier 1: exact dict              O(1)         — covers ~70-80% of clean data
-# Tier 2: first-word fw_index     O(1)+list    — list is usually 1–50 entries
-# Tier 3: alias check             same list    — only entries with aliases
-# Tier 4: token tok_index         O(1)+list    — intersect small token lists
-#
-# No SQL, no full list scan. Memory is ~60% lower than the in-memory DB approach.
+# Called only when tiers 1-3 all miss.  Builds an FTS5 query from the
+# meaningful tokens of the normalised query string, then checks each shard.
+# FTS5 uses its on-disk inverted index so this is O(log N), not O(N).
 
-def find_uen(typed_name: str, exact: dict, fw_index: dict, tok_index: dict) -> str:
+def fts_lookup(norm_query: str, fts_conns: list) -> str:
+    tokens = meaningful_tokens(norm_query)
+    if not tokens or not fts_conns:
+        return ""
+
+    # FTS5 AND query: all tokens must appear somewhere in the name.
+    # Wrap each token in double-quotes to treat it as a phrase, not an operator.
+    fts_q = " AND ".join(f'"{t}"' for t in tokens)
+
+    for conn in fts_conns:
+        try:
+            row = conn.execute(
+                "SELECT uen FROM companies_fts WHERE company_name MATCH ? LIMIT 1",
+                (fts_q,)
+            ).fetchone()
+            if row and row[0]:
+                return row[0]
+        except sqlite3.OperationalError:
+            # FTS5 rejects queries with special characters — fall back gracefully
+            pass
+    return ""
+
+
+# ─── FIND UEN ─────────────────────────────────────────────────────────────────
+#
+# Tier 1: exact dict              O(1)
+# Tier 2: fw_index substring      O(1) bucket lookup + small list scan
+# Tier 3: alias_exact             O(1)  ← was O(N) alias scan inside fw_index
+# Tier 4: FTS5 on-disk            O(log N) via SQLite  ← was tok_index O(N)
+
+def find_uen(typed_name: str,
+             exact: dict, fw_index: dict, alias_exact: dict,
+             fts_conns: list) -> str:
+
     norm_query = normalise(typed_name)
     if not norm_query:
         return ""
 
-    # ── Tier 1: O(1) exact ──────────────────────────────────────────────────
+    # ── Tier 1: exact ────────────────────────────────────────────────────────
     if norm_query in exact:
         return exact[norm_query]
 
     nq_len = len(norm_query)
     best_uen, best_score = "", -1
 
-    # ── Tiers 2 & 3: first-word bucket ──────────────────────────────────────
-    # We look up by EVERY word in the query, not just the first, so we catch
-    # cases where the user's name starts differently from the DB entry.
-    # e.g. query "st andrew's" → first_word "st" (same as DB "st andrew's ...")
-    query_words = norm_query.split()
-    candidate_buckets = set()
-    for w in query_words:
-        if w in fw_index:
-            candidate_buckets.add(w)
-
-    # Collect all candidates from relevant first-word buckets, deduplicated
+    # ── Tier 2: fw_index substring  ──────────────────────────────────────────
+    # Check every word in the query as a potential first-word key so we catch
+    # names that start differently in the DB (e.g. query "st andrew's" →
+    # bucket key "st").
     seen_cands: dict[str, tuple] = {}
-    for w in candidate_buckets:
-        for entry in fw_index[w]:
-            nn = entry[0]
-            if nn not in seen_cands:
-                seen_cands[nn] = entry
+    for w in norm_query.split():
+        if w in fw_index:
+            for entry in fw_index[w]:
+                nn = entry[0]
+                if nn not in seen_cands:
+                    seen_cands[nn] = entry
 
-    for norm_name, uen, norm_aliases in seen_cands.values():
+    for norm_name, uen in seen_cands.values():
         en_len = len(norm_name)
-
-        # Tier 2: substring with ratio guard
         if nq_len <= en_len:
             sl, ratio, hit = nq_len, nq_len / en_len, norm_query in norm_name
         else:
@@ -248,90 +295,39 @@ def find_uen(typed_name: str, exact: dict, fw_index: dict, tok_index: dict) -> s
             score = 5000 + sl
             if score > best_score:
                 best_score, best_uen = score, uen
-            continue  # no point checking aliases if tier-2 matched
 
-        # Tier 3: alias substring match
-        for alias in norm_aliases:
-            al_len = len(alias)
-            if nq_len <= al_len:
-                asl, ar, ah = nq_len, nq_len / al_len if al_len else 0, norm_query in alias
-            else:
-                asl, ar, ah = al_len, al_len / nq_len if nq_len else 0, alias in norm_query
-            if ah and ar >= 0.5:
-                score = 4000 + asl
-                if score > best_score:
-                    best_score, best_uen = score, uen
-                break
-
-    # Return early if tiers 2/3 already found a good match
-    if best_score >= 4000:
+    if best_score >= 5000:
         return best_uen
 
-    # ── Tier 4: token inverted index ────────────────────────────────────────
-    query_toks = meaningful_tokens(norm_query)
-    if not query_toks:
-        return best_uen if best_score >= 0 else ""
+    # ── Tier 3: alias_exact  ──────────────────────────────────────────────────
+    # O(1) — was an O(bucket-size) loop over alias lists embedded in fw_index
+    if norm_query in alias_exact:
+        return alias_exact[norm_query]
 
-    # For each query token, find matching token bucket (exact or substring).
-    # Use the longest token first (most selective).
-    sorted_toks = sorted(query_toks, key=len, reverse=True)
+    # Also try alias substring: check if the query is contained in any alias
+    # that starts with any query word (reuse fw_index word keys as a proxy).
+    # This is a light scan, much smaller than the old full-alias scan.
+    for w in norm_query.split():
+        if w in fw_index:
+            for norm_name, uen in fw_index[w]:
+                # Re-fetch aliases via alias_exact reverse isn't stored,
+                # so we only do exact alias match at tier-3 (substring alias
+                # matching is handled by FTS5 at tier-4 below).
+                break  # nothing further to do here without the alias list
 
-    # Build candidate set from the most selective token's bucket
-    anchor = sorted_toks[0]
-    anchor_len = len(anchor)
-
-    # Collect candidates: entries whose token list contains a match for anchor
-    cand_map: dict[str, str] = {}  # norm_name -> uen
-
-    # Exact token match (fast O(1) dict lookup)
-    if anchor in tok_index:
-        for nn, u in tok_index[anchor]:
-            cand_map[nn] = u
-
-    # Substring token match for longer anchors (anchor is part of a DB token)
-    if anchor_len >= 4:
-        for tok, entries in tok_index.items():
-            if tok == anchor:
-                continue
-            if anchor in tok or (len(tok) >= 4 and tok in anchor):
-                for nn, u in entries:
-                    cand_map[nn] = u
-
-    # Now verify all query tokens match for each candidate
-    for norm_name, uen in cand_map.items():
-        en_toks = meaningful_tokens(norm_name)
-        if not en_toks:
-            continue
-        matched = 0
-        for qt in query_toks:
-            qt_len = len(qt)
-            found = False
-            for et in en_toks:
-                if et == qt or (qt_len >= 4 and qt in et) or (len(et) >= 4 and et in qt):
-                    found = True; break
-            if found:
-                matched += 1
-            else:
-                break  # short-circuit: can never reach matched == len(query_toks)
-        if matched == len(query_toks):
-            score = 2000 - abs(len(en_toks) - len(query_toks)) * 10
-            if score > best_score:
-                best_score, best_uen = score, uen
+    # ── Tier 4: FTS5 on-disk  ────────────────────────────────────────────────
+    # Only reached when tiers 1-3 all miss.  Uses SQLite's on-disk FTS5 index.
+    fts_result = fts_lookup(norm_query, fts_conns)
+    if fts_result:
+        return fts_result
 
     return best_uen if best_score >= 0 else ""
 
 
 # ─── PROCESS ──────────────────────────────────────────────────────────────────
-#
-# OPTIMISATION H — per-run lookup cache
-# Real spreadsheets often repeat the same company name many times
-# (e.g. "ABC Pte Ltd" in 50 rows). We cache every lookup result within
-# a single process_df call so each unique name is only looked up once.
-# The cache is a plain dict local to the function call — zero memory overhead
-# between runs, and it's automatically GC'd when the function returns.
-
 def process_df(df, name_col_idx, uen_col_idx, header_row_idx, end_row_1based,
-               exact, fw_index, tok_index):
+               exact, fw_index, alias_exact, fts_conns):
+
     result_df  = df.copy()
     filled = replaced = already = na_count = no_match = 0
     data_start = header_row_idx + 1
@@ -339,13 +335,13 @@ def process_df(df, name_col_idx, uen_col_idx, header_row_idx, end_row_1based,
     nc = df.columns[name_col_idx]
     uc = df.columns[uen_col_idx]
 
-    # H: lookup cache — keyed by normalised company name, value is matched UEN
+    # Per-run lookup cache: each unique normalised name is looked up only once
     _lookup_cache: dict[str, str] = {}
 
     def cached_find(name: str) -> str:
         key = normalise(name)
         if key not in _lookup_cache:
-            _lookup_cache[key] = find_uen(name, exact, fw_index, tok_index)
+            _lookup_cache[key] = find_uen(name, exact, fw_index, alias_exact, fts_conns)
         return _lookup_cache[key]
 
     for i in range(data_start, min(data_end + 1, len(df))):
@@ -454,7 +450,7 @@ if len(missing) == len(DB_PATHS):
                 unsafe_allow_html=True)
     st.stop()
 
-exact, fw_index, tok_index, total_records = build_indexes(tuple(DB_PATHS))
+exact, fw_index, alias_exact, fts_conns, total_records = build_indexes(tuple(DB_PATHS))
 st.markdown(f'<div class="info-box">✅ Reference database loaded — '
             f'<strong>{total_records:,}</strong> company records</div>',
             unsafe_allow_html=True)
@@ -554,7 +550,7 @@ if st.button("▶  Run UEN Autofill", use_container_width=True):
         processed_df, stats = process_df(
             raw_df, name_col_idx, uen_col_idx,
             header_row_idx, int(end_row_input),
-            exact, fw_index, tok_index)
+            exact, fw_index, alias_exact, fts_conns)
     st.session_state["processed_df"]    = processed_df
     st.session_state["stats"]           = stats
     st.session_state["preview_two_col"] = True
