@@ -35,83 +35,11 @@ Many internal spreadsheets contain company names but are missing their UENs. Thi
 .
 ├── uen_autofill_app.py   # Main Streamlit app
 ├── requirements.txt
-├── database_1.db         # ACRA data shard A–K  ┐
-├── database_2.db         # ACRA data shard L–Z  │ not included in repo
-├── database_3.db         # ACRA data shard Others│ (see Database setup below)
-├── database_4.db         # Custom alias table   ┘
+├── database_1.db
+├── database_2.db
+├── database_3.db
+├── database_4.db
 └── README.md
-```
-
----
-
-## Setup
-
-### 1. Install dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-`requirements.txt`:
-```
-streamlit>=1.32.0
-pandas>=2.0.0
-openpyxl>=3.1.0
-xlrd>=2.0.1
-```
-
-### 2. Build the database
-
-Download the ACRA public register CSVs from [data.gov.sg](https://data.gov.sg) and run the build script below. You will need three ACRA CSV files and optionally an alias Excel file.
-
-```python
-import pandas as pd
-import sqlite3
-
-def build_shard(df, db_path):
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS companies (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            company_name TEXT,
-            uen          TEXT,
-            aliases      TEXT
-        )
-    """)
-    df.to_sql("companies", conn, if_exists="append", index=False)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_name ON companies(company_name)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_uen  ON companies(uen)")
-    conn.commit()
-    conn.close()
-
-# ── ACRA shards ──────────────────────────────────────────────────────────────
-file_a = "ACRA Information on Corporate Entities ('A' - 'K').csv"
-file_b = "ACRA Information on Corporate Entities ('L' - 'Z').csv"
-file_c = "ACRA Information on Corporate Entities ('Others').csv"
-
-for csv_file, db_out in [(file_a, "database_1.db"),
-                          (file_b, "database_2.db"),
-                          (file_c, "database_3.db")]:
-    df = pd.read_csv(csv_file, low_memory=False)
-    df = df[["entity_name", "uen"]].dropna().drop_duplicates()
-    df.columns = ["company_name", "uen"]
-    df["aliases"] = ""
-    build_shard(df, db_out)
-
-# ── Custom alias table (optional) ────────────────────────────────────────────
-alias_df = pd.read_excel("company_uen_data.xlsx")
-alias_df = alias_df[["CompanyName", "UEN", "Aliases"]]
-alias_df.columns = ["company_name", "uen", "aliases"]
-build_shard(alias_df, "database_4.db")
-
-print("✅ All database shards built.")
-```
-
-### 3. Run the app
-
-```bash
-streamlit run uen_autofill_app.py
 ```
 
 ---
